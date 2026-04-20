@@ -1,0 +1,819 @@
+#include <WiFi.h>
+#include <ThingSpeak.h>
+#include <Keypad.h>
+#include <EEPROM.h>
+#include <Adafruit_Fingerprint.h>
+#include <HardwareSerial.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include "BluetoothSerial.h"
+
+
+// ================= WIFI + THINGSPEAK =================
+const char* ssid = "Galaxy F415846";
+const char* wifiPassword = "12tree45";
+const char* mqtt_server = "a863e6bdc19548d1b79e4ea703dc0872.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "esp32door";
+const char* mqtt_pass = "Door1234";
+const char* statusTopic = "door/status";
+
+
+WiFiClientSecure mqttSecureClient;
+PubSubClient mqttClient(mqttSecureClient);
+BluetoothSerial SerialBT;
+enum Mode { WIFI_MODE, BT_MODE };
+Mode currentMode = BT_MODE;
+unsigned long lastReconnect = 0;
+unsigned long reconnectInterval = 3000;
+#define CURRENT_VERSION "1.7"
+#define DEVICE_ID "LOCK_01"
+String versionUrl =
+  "https://raw.githubusercontent.com/DhanushNaidu17/esp32_firmware/main/"
+  + String(DEVICE_ID) + ".txt";
+
+
+unsigned long updateCheckInterval = 10 * 60 * 1000; // 3 minutes
+unsigned long lastUpdateCheck = 0;
+unsigned long lastBTActivity = 0;
+unsigned long btTimeout = 60000; // 60 seconds
+unsigned long lastWiFiAttempt = 0;
+unsigned long wifiRetryInterval = 5000; // 5 sec
+unsigned long wifiStartTime = 0;
+unsigned long wifiConnectTimeout = 15000; // 15 sec
+unsigned long btStartTime = 0;
+unsigned long btWaitTime = 180000; // 3 minutes
+bool wifiConnecting = false;
+bool btWasConnected = false;
+
+unsigned long wifiTryStart = 0;
+bool tryingWiFi = false;
+const unsigned long WIFI_TRY_DURATION = 180000; // 3 min
+
+
+unsigned long channelID = 3261082;
+const char* writeAPIKey = "UBXVN7WD7BQ6E0MM";
+
+WiFiClient client;
+unsigned long lastTSUpdate = 0;
+
+// ===== ThingSpeak Queue System =====
+bool pendingUpdate = false;
+int pendingDoorStatus = 0;
+int pendingAccessType = 0;
+
+
+void sendToThingSpeak(int doorStatus, int accessType) {
+
+  unsigned long now = millis();
+
+  if (now - lastTSUpdate < 15000) {
+    Serial.println("⏳ Waiting for ThingSpeak interval...");
+    return;
+  }
+
+  ThingSpeak.setField(1, doorStatus);
+
+  // Only update access type when valid
+  if (accessType > 0) {
+    ThingSpeak.setField(2, accessType);
+  }
+
+  int response = ThingSpeak.writeFields(channelID, writeAPIKey);
+
+  if (response == 200) {
+    Serial.println("📡 Data sent to ThingSpeak");
+    lastTSUpdate = now;
+  }
+}
+
+
+
+// ================= CONFIG =================
+#define FP_RX 16
+#define FP_TX 17
+#define FP_BAUD 57600
+
+#define BT_RX 18
+#define BT_TX 19
+
+#define OWNER_COUNT_ADDR 10
+#define DOOR_LED 4
+
+#define HOLD_TIME_MS 3000
+#define TIMEOUT_MS   10000
+// =========================================
+
+// ================= SERIAL =================
+HardwareSerial FingerSerial(2);
+
+Adafruit_Fingerprint finger(&FingerSerial);
+
+// ================= KEYPAD =================
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {32, 33, 25, 26};
+byte colPins[COLS] = {27, 14, 12, 13};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ================= PASSWORD =================
+String password = "";
+String input = "";
+String adminInput = "";
+String newPass = "";
+const String adminKey = "1432";
+
+// ================= STATES =================
+bool enrollMode = false;
+bool resetMode = false;
+bool enteringNewPass = false;
+bool confirmingPass = false;
+bool normalEntryActive = false;
+
+unsigned long modeTimer = 0;
+
+// ================= DOOR =================
+bool doorActive = false;
+unsigned long doorStartTime = 0;
+unsigned long doorDuration = 15000;   // 15 seconds
+
+// ================= DECLARATIONS =================
+void keypadEvent(KeypadEvent key);
+bool enrollNewOwner();
+void checkFingerprint();
+void showPrompt();
+void exitToMain();
+
+// ================= EEPROM =================
+void savePassword(String pass) {
+  for (int i = 0; i < 6; i++) EEPROM.write(i, pass[i]);
+  EEPROM.commit();
+}
+
+String readPassword() {
+  String pass = "";
+  for (int i = 0; i < 6; i++) pass += char(EEPROM.read(i));
+  return pass;
+}
+
+// ================= PROMPT =================
+void showPrompt() {
+  Serial.println("\n👉 Enter password / fingerprint / Bluetooth5 OPEN");
+}
+
+// ================= EXIT =================
+void exitToMain() {
+  enrollMode = false;
+  resetMode = false;
+  enteringNewPass = false;
+  confirmingPass = false;
+  normalEntryActive = false;
+
+  input = "";
+  adminInput = "";
+  newPass = "";
+
+  Serial.println("\n⏱ Timeout - Returning to Main");
+  showPrompt();
+}
+void checkForOTAUpdate() {
+
+  Serial.println("🔄 Checking for OTA update...");
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
+  HTTPClient https;
+
+  if (https.begin(secureClient, versionUrl)) {
+
+    int httpCode = https.GET();
+
+    if (httpCode == 200) {
+
+      String latestVersion = https.getString();
+      latestVersion.trim();
+
+      Serial.print("Current Version: ");
+      Serial.println(CURRENT_VERSION);
+
+      Serial.print("Latest Version: ");
+      Serial.println(latestVersion);
+
+      if (latestVersion != CURRENT_VERSION) {
+
+        Serial.println("🚀 New version found!");
+
+        // 🔥 AUTO BUILD FIRMWARE URL
+        String firmwareURL =
+         "https://raw.githubusercontent.com/DhanushNaidu17/esp32_firmware/main/"
+         + String(DEVICE_ID) + ".ino.bin";
+
+
+
+        Serial.println("Downloading from:");
+        Serial.println(firmwareURL);
+
+t_httpUpdate_return ret =
+    httpUpdate.update(secureClient, firmwareURL);
+
+switch (ret) {
+
+  case HTTP_UPDATE_FAILED:
+    Serial.printf("❌ Update failed. Error (%d): %s\n",
+      httpUpdate.getLastError(),
+      httpUpdate.getLastErrorString().c_str());
+    break;
+
+  case HTTP_UPDATE_NO_UPDATES:
+    Serial.println("No updates available.");
+    break;
+
+  case HTTP_UPDATE_OK:
+    Serial.println("✅ Update successful!");
+    break;
+}
+
+
+      } else {
+        Serial.println("✅ Device already up-to-date1.");
+      }
+
+    } else {
+      Serial.println("❌ Failed to fetch version file.");
+    }
+
+    https.end();
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length)
+{
+  String message;
+
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.print("MQTT Received: ");
+  Serial.println(message);
+
+  // ===== OPEN =====
+  if (message == "1") {
+
+    Serial.println("🌐 MQTT OPEN");
+
+    digitalWrite(DOOR_LED, LOW);
+    publishDoorStatus(1);
+
+    doorActive = true;
+    doorStartTime = millis();
+    
+
+    sendToThingSpeak(1, 4);
+  }
+
+  // ===== CLOSE =====
+  else if (message == "0") {
+
+    Serial.println("🌐 MQTT CLOSE");
+
+    digitalWrite(DOOR_LED, HIGH);
+    publishDoorStatus(0);
+
+    doorActive = false;
+    doorStartTime = 0;   // reset timer
+
+    sendToThingSpeak(0, -1);
+  }
+}
+void connectMQTT() {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  delay(1000);   // 🔥 VERY IMPORTANT
+
+  Serial.print("Connecting to MQTT... ");
+
+  if (mqttClient.connect("LOCK_01", mqtt_user, mqtt_pass)) {
+    Serial.println("Connected");
+
+    mqttClient.subscribe("door/control");
+    publishDoorStatus(digitalRead(DOOR_LED));
+
+  } else {
+    Serial.print("Failed, rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+void publishDoorStatus(int status) {
+
+  if (mqttClient.connected()) {
+
+    String payload = String(status);
+    mqttClient.publish(statusTopic, payload.c_str(), true); 
+    // true = retained message (important)
+
+    Serial.print("📡 Status Published: ");
+    Serial.println(payload);
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  SerialBT.begin("ESP32_LOCK");
+  btStartTime = millis();
+  Serial.println("🔵 Bluetooth Started - Ready to pair"); 
+  unsigned long start = millis();
+  while (millis() - start < 1000);
+
+  Serial.println("System Starting...");  // test line
+
+  ThingSpeak.begin(client);
+
+  EEPROM.begin(512);
+
+  pinMode(DOOR_LED, OUTPUT);
+  digitalWrite(DOOR_LED, HIGH);
+  publishDoorStatus(0);
+
+  keypad.addEventListener(keypadEvent);
+    
+  keypad.setHoldTime(HOLD_TIME_MS);
+
+  password = readPassword();
+
+  bool valid = true;
+
+  for (int i = 0; i < 6; i++) {
+    if (!isDigit(password[i])) {
+      valid = false;
+      break;
+    }
+  }
+
+  if (!valid) {
+    Serial.println("⚠ Invalid EEPROM → setting default password");
+
+    password = "654321";
+    savePassword(password);
+  }
+  FingerSerial.begin(FP_BAUD, SERIAL_8N1, FP_RX, FP_TX);
+  finger.begin(FP_BAUD);
+
+  if (!finger.verifyPassword()) {
+    Serial.println("❌ Fingerprint sensor not detected");
+  } else {
+    Serial.println("✅ Fingerprint sensor OK");
+  }
+
+
+  SerialBT.println("Door Locked");
+
+  finger.getTemplateCount();   // 🔥 MUST ADD
+
+  uint16_t templateCount = finger.templateCount;
+
+  Serial.print("Finger count: ");
+  Serial.println(templateCount);
+
+  if (templateCount == 0) {
+    Serial.println("🔑 No fingerprints → enroll first user");
+
+    if (enrollNewOwner()) {
+      Serial.println("✅ First owner saved");
+    }
+  }
+
+  mqttSecureClient.setInsecure();   // 🔥 REQUIRED
+  mqttSecureClient.setTimeout(15000);
+
+  Serial.println("🔐 Door Lock Ready");
+  showPrompt();
+}
+
+void loop() {
+  static unsigned long wifiFailStart = 0;
+  bool btConnected = SerialBT.hasClient();
+  static bool wifiStarted = false;
+
+
+  // ===== BT MODE =====
+  if (currentMode == BT_MODE) {
+
+    if (btConnected) {
+      // stay in BT
+    }
+
+    else {
+
+      // 🔥 WAIT 10 seconds before switching
+      if (millis() - btStartTime < 10000) {
+        // do nothing → wait for user
+        return;
+      }
+
+      if (!wifiStarted) {
+        Serial.println("❌ BT Disconnected (after wait)");
+
+        Serial.println("🛑 Stopping Bluetooth BEFORE WiFi...");
+        SerialBT.end();
+
+        delay(500);
+
+        Serial.println("📡 Starting WiFi...");
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssid, wifiPassword);
+
+        wifiTryStart = millis();
+        wifiStarted = true;
+
+        currentMode = WIFI_MODE;
+      }
+    }
+  }
+
+  // ===== WIFI MODE =====
+  if (currentMode == WIFI_MODE) {
+
+    // ✅ If WiFi connected
+    if (WiFi.status() == WL_CONNECTED) {
+
+      Serial.println("📶 WiFi Connected");
+
+      if (!mqttClient.connected()) {
+        connectMQTT();
+      }
+
+      mqttClient.loop();
+    }
+
+    // ❌ If WiFi NOT connected → check timeout
+    else {
+
+      if (millis() - wifiTryStart > WIFI_TRY_DURATION) {
+
+        Serial.println("❌ WiFi Failed → Back to BT");
+
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+
+        delay(500);   // 🔥 IMPORTANT
+
+        SerialBT.begin("ESP32_LOCK");
+        btStartTime = millis();   // 🔥 IMPORTANT
+
+        wifiStarted = false;
+
+        currentMode = BT_MODE;
+      }
+    }
+  }
+
+  static Mode lastMode = WIFI_MODE;
+  static int lastWiFiStatus = -1;
+  static bool lastBTState = false;
+
+  bool currentBT = SerialBT.hasClient();
+  int currentWiFi = WiFi.status();
+
+  if (currentMode != lastMode || currentWiFi != lastWiFiStatus || currentBT != lastBTState) {
+
+    Serial.print("Mode: ");
+    Serial.print(currentMode == WIFI_MODE ? "WIFI" : "BT");
+
+    Serial.print(" | WiFi: ");
+    Serial.print(currentWiFi);
+
+    Serial.print(" | BT: ");
+    Serial.println(currentBT ? "Connected" : "Waiting");
+
+    lastMode = currentMode;
+    lastWiFiStatus = currentWiFi;
+    lastBTState = currentBT;
+  }
+
+  // ===== MQTT =====
+
+
+  // ===== ThingSpeak Queue =====
+  if (pendingUpdate && millis() - lastTSUpdate >= 15000) {
+    ThingSpeak.setField(1, pendingDoorStatus);
+    ThingSpeak.setField(2, pendingAccessType);
+
+    int response = ThingSpeak.writeFields(channelID, writeAPIKey);
+    if (response == 200) {
+      Serial.println("📡 Queued Data Sent");
+      lastTSUpdate = millis();
+      pendingUpdate = false;
+    }
+  }
+
+  // ===== Timeout =====
+  if ((enrollMode || resetMode || normalEntryActive) &&
+      millis() - modeTimer >= TIMEOUT_MS) {
+    exitToMain();
+    return;
+  }
+
+// ===== BLUETOOTH =====
+
+
+bool nowConnected = SerialBT.hasClient();
+
+if (nowConnected && !btWasConnected) {
+  Serial.println("✅ BT Connected");
+}
+
+if (!nowConnected && btWasConnected) {
+  Serial.println("❌ BT Disconnected");
+}
+
+btWasConnected = nowConnected;
+
+  static String btBuffer = "";
+
+  while (SerialBT.available()) {
+
+    char c = SerialBT.read();
+
+    if (isPrintable(c)) {
+      Serial.print(c);
+    }  // debug
+
+    // ignore newline chars
+    if (c == '\n' || c == '\r') continue;
+
+    btBuffer += c;
+
+    btBuffer.trim();
+    btBuffer.toUpperCase();
+
+    if (btBuffer.indexOf("OPEN") != -1) {
+
+      Serial.println("\nBT OPEN CMD");
+
+      digitalWrite(DOOR_LED, LOW);
+      publishDoorStatus(1);
+
+      doorActive = true;
+      doorStartTime = millis();
+
+      sendToThingSpeak(1, 3);
+
+      btBuffer = "";
+    }
+
+    else if (btBuffer.indexOf("CLOSE") != -1) {
+
+      Serial.println("\nBT CLOSE CMD");
+
+      digitalWrite(DOOR_LED, HIGH);
+      publishDoorStatus(0);
+
+      doorActive = false;
+
+      sendToThingSpeak(0, -1);
+
+      btBuffer = "";
+    }
+
+    // prevent overflow
+    if (btBuffer.length() > 10) {
+      btBuffer = "";
+    }
+  }
+  // ===== FINGERPRINT (VERY IMPORTANT) =====
+  checkFingerprint();
+
+  // ===== AUTO CLOSE =====
+  if (doorActive && millis() - doorStartTime >= doorDuration) {
+    digitalWrite(DOOR_LED, HIGH);
+    publishDoorStatus(0);
+    doorActive = false;
+    sendToThingSpeak(0, -1);
+    Serial.println("🔒 Door Locked");
+  }
+ //===== keypad==========
+char key = keypad.getKey();
+
+if (key) {
+
+  modeTimer = millis();
+
+  // ================= RESET MODE =================
+  if (resetMode) {
+
+    if (key >= '0' && key <= '9') {
+      input += key;
+      Serial.print("*");
+    }
+
+    // Step 1: Admin verify
+    if (!enteringNewPass && input.length() == 4) {
+
+      Serial.println();
+
+      if (input == adminKey) {
+        Serial.println("🔓 Admin Verified");
+        Serial.println("Enter NEW password:");
+
+        enteringNewPass = true;
+        input = "";
+      } else {
+        Serial.println("❌ Wrong Admin Key");
+        resetMode = false;
+        input = "";
+        showPrompt();
+      }
+    }
+
+    // Step 2: Enter new password
+    else if (enteringNewPass && !confirmingPass && input.length() == 6) {
+
+      newPass = input;
+      confirmingPass = true;
+      input = "";
+
+      Serial.println("\nRe-enter NEW password:");
+    }
+
+    // Step 3: Confirm password
+    else if (confirmingPass && input.length() == 6) {
+
+      if (input == newPass) {
+
+        password = newPass;
+        savePassword(password);
+
+        Serial.println("\n✅ Password Saved to EEPROM");
+
+      } else {
+        Serial.println("\n❌ Password mismatch");
+      }
+
+      resetMode = false;
+      enteringNewPass = false;
+      confirmingPass = false;
+      input = "";
+
+      showPrompt();
+    }
+
+    return;   // 🔥 VERY IMPORTANT
+  }
+
+  // ================= NORMAL MODE =================
+  if (key >= '0' && key <= '9') {
+    input += key;
+    Serial.print("*");
+  }
+
+  if (input.length() == 6) {
+
+    Serial.println();
+
+    if (input == password) {
+      Serial.println("✅ ACCESS GRANTED");
+
+      digitalWrite(DOOR_LED, LOW);
+      publishDoorStatus(1);
+
+      doorActive = true;
+      doorStartTime = millis();
+
+      sendToThingSpeak(1, 1);
+    } else {
+      Serial.println("❌ ACCESS DENIED");
+    }
+
+    input = "";
+    showPrompt();
+  }
+}
+}
+
+// ================= FINGERPRINT =================
+void checkFingerprint() {
+
+  static unsigned long lastCheck = 0;
+
+  // run every 200ms only
+  if (millis() - lastCheck < 200) return;
+  lastCheck = millis();
+
+  int p = finger.getImage();
+
+  if (p != FINGERPRINT_OK) return;
+
+  if (finger.image2Tz() != FINGERPRINT_OK) return;
+  if (finger.fingerFastSearch() != FINGERPRINT_OK) return;
+
+  Serial.print("🖐 Finger MATCH ID: ");
+  Serial.println(finger.fingerID);
+
+  digitalWrite(DOOR_LED, LOW);
+  publishDoorStatus(1);
+
+  doorActive = true;
+  doorStartTime = millis();
+
+  sendToThingSpeak(1, 2);
+}
+// ================= ENROLL OWNER =================
+bool enrollNewOwner() {
+
+  static int step = 0;
+  static uint8_t newID = 0;
+
+  if (step == 0) {
+    finger.getTemplateCount();
+    newID = finger.templateCount + 1;
+
+    Serial.print("👤 Enrolling ID ");
+    Serial.println(newID);
+
+    Serial.println("Place finger");
+    step = 1;
+  }
+
+  if (step == 1) {
+    int p = finger.getImage();
+
+    if (p == FINGERPRINT_OK) {
+      if (finger.image2Tz(1) == FINGERPRINT_OK) {
+        Serial.println("Remove finger");
+        step = 2;
+      }
+    }
+  }
+
+  if (step == 2) {
+    if (finger.getImage() == FINGERPRINT_NOFINGER) {
+      Serial.println("Place SAME finger again");
+      step = 3;
+    }
+  }
+
+  if (step == 3) {
+    int p = finger.getImage();
+
+    if (p == FINGERPRINT_OK) {
+      if (finger.image2Tz(2) == FINGERPRINT_OK &&
+          finger.createModel() == FINGERPRINT_OK &&
+          finger.storeModel(newID) == FINGERPRINT_OK) {
+
+        EEPROM.write(OWNER_COUNT_ADDR, newID);
+        EEPROM.commit();
+
+        Serial.println("✅ Enrolled Successfully");
+
+        step = 0;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+// ================= HOLD EVENTS =================
+// ================= HOLD EVENTS =================
+void keypadEvent(KeypadEvent key) {
+
+  KeyState state = keypad.getState();
+
+  // 🔄 RESET MODE (HOLD #)
+  if (state == HOLD && key == '#') {
+
+    resetMode = true;
+    input = "";
+    modeTimer = millis();
+
+    Serial.println("\n🔄 RESET PASSWORD MODE (HOLD)");
+    Serial.println("Enter admin key:");
+  }
+
+  // 🔐 ENROLL MODE (HOLD *)
+  if (state == HOLD && key == '*') {
+
+    enrollMode = true;
+    adminInput = "";
+    modeTimer = millis();
+
+    Serial.println("\n🔐 ADD NEW OWNER MODE (HOLD)");
+    Serial.println("Enter admin key:");
+  }
+}
